@@ -13,6 +13,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib, Gdk, GdkPixbuf  # noqa: E402
 
+import http.client
 import json
 import os
 import subprocess
@@ -46,20 +47,32 @@ def cfg():
 
 
 def rest(method, path, body=None, timeout=8):
+    """请求本机 mihomo 控制接口(主机固定为回环地址,端口与路径校验后使用)。"""
     c = cfg()
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{c.get('api_port', 9090)}{path}",
-        data=data, method=method)
-    req.add_header("Authorization", f"Bearer {c.get('secret', '')}")
-    if data:
-        req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            txt = r.read().decode()
-            return json.loads(txt) if txt.strip() else {}
+        port = int(c.get("api_port", 9090))
+    except (TypeError, ValueError):
+        port = 9090
+    if not (1024 <= port <= 65535):  # 端口来自本机配置,仍做范围校验
+        port = 9090
+    if not path.startswith("/") or ".." in path:
+        raise ValueError(f"非法控制接口路径: {path}")  # 只允许本机接口的固定端点
+    conn = None
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        data = json.dumps(body).encode() if body is not None else None
+        headers = {"Authorization": f"Bearer {c.get('secret', '')}"}
+        if data:
+            headers["Content-Type"] = "application/json"
+        conn.request(method, path, body=data, headers=headers)
+        r = conn.getresponse()
+        txt = r.read().decode()
+        return json.loads(txt) if txt.strip() else {}
     except Exception:
         return {}
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def run_cokectl(*args, timeout=120):
@@ -286,17 +299,13 @@ class CokeCloudWindow(Gtk.Window):
         threading.Thread(target=self._do_mode, args=(mode,), daemon=True).start()
 
     def _do_mode(self, mode):
-        r = rest("PATCH", "/configs", {"mode": mode})
-        if isinstance(r, dict) and r.get("__error__"):
-            ui(self.set_status, f"模式切换失败: {r}")
-            return
-        c = cfg()
-        c["mode"] = mode
-        try:
-            with open(CONFIG_JSON, "w", encoding="utf8") as f:
-                json.dump(c, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        # 模式切换与配置持久化交由 cokectl(含 0600/0700 权限收紧),GUI 不直接写配置文件
+        rc, out = run_cokectl("mode", mode, timeout=20)
+        if rc == 0:
+            ui(self.set_status,
+               out.splitlines()[-1] if out else f"已切换为{MODE_LABEL[mode]}模式")
+        else:
+            ui(self.set_status, f"模式切换失败: {out}")
         ui(self.refresh_all)
 
     def on_tun(self, sw, _):

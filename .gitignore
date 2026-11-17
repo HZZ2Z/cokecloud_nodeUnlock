@@ -1,0 +1,27 @@
+# ===== 隐私与防误提交(根目录规则,作用于全仓库)=====
+# 说明:子目录 .gitignore 的规则只对其所在目录生效,管不到仓库根,
+# 因此根目录需要一份兜底规则(原先 cokecloud-linux/.gitignore 的
+# ../research/ 写法对仓库根的 research/ 无效)。
+
+# 调研材料/网页抓取(含服务商端点等敏感信息,严禁入库)
+/research/
+
+# 用户私有配置与运行产物(含订阅 token、节点凭据),防误提交
+config.json
+plan.json
+nodes-cache.json
+sub-raw.yaml
+runtime.yaml
+cache.db
+.env
+.env.*
+
+# 日志、进程、缓存与临时文件
+*.log
+*.pid
+*.pyc
+__pycache__/
+ui/
+
+# 本地工具状态
+.mimosa/

@@ -28,6 +28,7 @@ cokectl —— CokeCloud Linux 客户端
 """
 
 import base64
+import getpass
 import http.server
 import json
 import os
@@ -56,7 +57,20 @@ LOG_FILE = os.path.join(CONF_DIR, "mihomo.log")
 PID_FILE = os.path.join(CONF_DIR, "mihomo.pid")
 UI_DIR = os.path.join(CONF_DIR, "ui")
 
-API_BASE = "https://cokecloud.online"        # V2Board 站点默认值,可在配置里用 api_base 覆盖
+# 服务商面板地址属隐私信息,不入库:从本地配置 api_base 或环境变量
+# COKECLOUD_API_BASE 读取;未配置时按需报错提示。
+DEFAULT_API_BASE = ""
+
+
+def api_base(cfg=None):
+    """面板地址:本地配置 api_base > 环境变量 COKECLOUD_API_BASE。"""
+    base = ((cfg or load_cfg()).get("api_base")
+            or os.environ.get("COKECLOUD_API_BASE") or DEFAULT_API_BASE)
+    if not base:
+        die("尚未配置面板地址:请在 ~/.config/cokecloud/config.json 写入\n"
+            "      \"api_base\": \"https://你的面板域名\"\n"
+            "      或设置环境变量 COKECLOUD_API_BASE")
+    return base.rstrip("/")
 SUB_UA = "mihomo/1.19.34 (cokectl-linux)"    # 服务端对此 UA 返回完整 clash 配置
 GROUP_MAIN = "🔰 节点选择"                    # 主选择策略组(订阅自带)
 GROUP_AUTO = "♻️ 自动选择"
@@ -102,10 +116,28 @@ def load_cfg():
         return json.load(f)
 
 
-def save_cfg(cfg):
+def ensure_conf_dir():
+    """配置目录收紧为 0700,不随 umask 放开。"""
     os.makedirs(CONF_DIR, exist_ok=True)
-    with open(CONFIG_JSON, "w", encoding="utf8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    try:
+        os.chmod(CONF_DIR, 0o700)
+    except OSError:
+        pass
+
+
+def write_private(path, text):
+    """写敏感文件(令牌/订阅/节点凭据):权限强制 0600,不随 umask 泄露。"""
+    with open(path, "w", encoding="utf8") as f:
+        f.write(text)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def save_cfg(cfg):
+    ensure_conf_dir()
+    write_private(CONFIG_JSON, json.dumps(cfg, ensure_ascii=False, indent=2))
 
 
 def api_headers(cfg):
@@ -123,13 +155,14 @@ def cmd_login(args):
     cfg = load_cfg()
     if args and len(args) >= 2:
         email, password = args[0], args[1]
+        warn("密码以命令行参数传入,会留在 shell 历史与进程列表中;建议改用无参数的 ./cokectl login 交互输入")
     else:
         email = input("邮箱: ").strip()
-        password = input("密码: ").strip()
+        password = getpass.getpass("密码: ")
     print("登录中 ...")
     body = json.dumps({"email": email, "password": password}).encode()
     req = urllib.request.Request(
-        load_cfg().get("api_base", API_BASE) + "/api/v1/passport/auth/login",
+        api_base(cfg) + "/api/v1/passport/auth/login",
         data=body,
         headers={"Content-Type": "application/json", "User-Agent": SUB_UA},
         method="POST",
@@ -159,7 +192,7 @@ def fetch_server_list(cfg):
     tok = cfg.get("api_token")
     if not tok:
         return None
-    api = cfg.get("api_base", API_BASE)
+    api = api_base(cfg)
     nodes = None
     try:
         data = http_json(api + "/api/v1/user/server/fetch",
@@ -171,9 +204,7 @@ def fetch_server_list(cfg):
         warn(f"面板节点接口不可用({e}),尝试本机缓存 ...")
     if nodes:
         try:
-            with open(NODES_CACHE, "w", encoding="utf8") as f:
-                json.dump(nodes, f, ensure_ascii=False)
-            os.chmod(NODES_CACHE, 0o600)
+            write_private(NODES_CACHE, json.dumps(nodes, ensure_ascii=False))
         except OSError:
             pass
         return nodes
@@ -214,6 +245,9 @@ def merge_client_nodes(txt, cfg):
     host_count = _collections.Counter(
         p.get("server") for p in proxies if p.get("type") == "ss")
     relay_host = host_count.most_common(1)[0][0] if host_count else None
+    # 真实中转域名后缀:从订阅中出现最多的中转域名自行推导,不写死服务商域名
+    relay_suffix = ("." + relay_host.split(".", 1)[1]
+                    if relay_host and "." in relay_host else None)
     new_names = []
     orig_names = set(names)  # 合并前的原节点名,用于识别"全量型"策略组
     for n in nodes:
@@ -223,8 +257,9 @@ def merge_client_nodes(txt, cfg):
         name = n.get("name") or f"node-{n.get('id')}"
         if not host or not port:
             continue
-        # 伪装域名(www.qq.com 等)替换为真实中转入口域名
-        if relay_host and "sys-metric-report.com" not in host:
+        # 伪装域名(www.qq.com 等)替换为真实中转入口域名;
+        # 已是真实中转域名(与订阅中转同域)的条目保持原样
+        if relay_host and not (relay_suffix and relay_suffix in host):
             host = relay_host
         if (host, port) in have:
             continue
@@ -281,7 +316,7 @@ def cmd_init(args):
     way = input("选择方式 [1/2]: ").strip()
     if way == "2":
         email = input("邮箱: ").strip()
-        password = input("密码: ").strip()
+        password = getpass.getpass("密码: ")
         sub_url = v2board_login_and_get_sub(email, password)
         cfg["api_email"] = email
         cfg["api_token"] = None  # 登录 token 仅一次性使用
@@ -307,7 +342,7 @@ def v2board_login_and_get_sub(email, password):
     print("登录中 ...")
     body = json.dumps({"email": email, "password": password}).encode()
     req = urllib.request.Request(
-        load_cfg().get("api_base", API_BASE) + "/api/v1/passport/auth/login",
+        api_base() + "/api/v1/passport/auth/login",
         data=body,
         headers={"Content-Type": "application/json", "User-Agent": SUB_UA},
         method="POST",
@@ -322,7 +357,7 @@ def v2board_login_and_get_sub(email, password):
     token = data["data"].get("token") or data["data"].get("auth_data")
     print("获取订阅信息 ...")
     sub = json.loads(http_get(
-        API_BASE + "/api/v1/user/getSubscribe",
+        api_base() + "/api/v1/user/getSubscribe",
         {"authorization": token, "User-Agent": SUB_UA},
     ).decode())
     url = sub.get("data", {}).get("subscribe_url")
@@ -350,8 +385,7 @@ def fetch_subscription(cfg):
             pass
     if "proxies:" not in txt:
         die("订阅内容不是 clash 格式(可能 token 失效或被限流),请稍后重试")
-    with open(SUB_RAW, "w", encoding="utf8") as f:
-        f.write(txt)
+    write_private(SUB_RAW, txt)
     return txt
 
 
@@ -424,7 +458,7 @@ def fetch_plan_info(cfg):
     if not tok:
         return None
     try:
-        api = load_cfg().get("api_base", API_BASE)
+        api = api_base()
         data = json.loads(http_get(
             api + "/api/v1/user/getSubscribe",
             {"authorization": tok, "User-Agent": SUB_UA}, timeout=30).decode())
@@ -456,10 +490,8 @@ def cmd_update(args):
     print("拉取订阅 ...")
     patched, raw = build_config_text(cfg)
     # SUB_RAW 保存未打补丁的合并版(供 UI/日志查看)
-    with open(SUB_RAW, "w", encoding="utf8") as f:
-        f.write(raw)
-    with open(RUNTIME_YAML, "w", encoding="utf8") as f:
-        f.write(patched)
+    write_private(SUB_RAW, raw)
+    write_private(RUNTIME_YAML, patched)
     ok(f"订阅已更新: {SUB_RAW} ({len(raw.splitlines())} 行)")
     ok(f"运行配置已生成: {RUNTIME_YAML}")
 
@@ -875,7 +907,7 @@ def cmd_ui(args):
         # 重新生成配置以带上 external-ui,并重启内核
         txt = open(SUB_RAW, encoding="utf8").read() if os.path.exists(SUB_RAW) else None
         if txt:
-            open(RUNTIME_YAML, "w", encoding="utf8").write(patch_config(txt, cfg))
+            write_private(RUNTIME_YAML, patch_config(txt, cfg))
         if core_alive():
             cmd_restart(args)
     port = cfg.get("api_port", 9090)
@@ -944,8 +976,7 @@ def _build_merged(force=False):
             _srv_state["txt"] = patched
             _srv_state["ts"] = now
             try:
-                with open(RUNTIME_YAML, "w", encoding="utf8") as f:
-                    f.write(patched)
+                write_private(RUNTIME_YAML, patched)
             except OSError:
                 pass
         if (_srv_state["plan"] is None
@@ -955,9 +986,8 @@ def _build_merged(force=False):
                 _srv_state["plan"] = info
                 _srv_state["plan_ts"] = now
                 try:
-                    with open(os.path.join(CONF_DIR, "plan.json"), "w",
-                              encoding="utf8") as f:
-                        json.dump(info, f)
+                    write_private(os.path.join(CONF_DIR, "plan.json"),
+                                  json.dumps(info, ensure_ascii=False))
                 except OSError:
                     pass
         return _srv_state["txt"], _srv_state["plan"]
@@ -1107,7 +1137,7 @@ def cmd_verge_import(args):
 USAGE = """用法: cokectl <命令> [参数]
 
   init              首次配置(订阅链接或账号密码)
-  login <邮箱> <密码>  登录面板,获取「客户端专用」节点权限
+  login [邮箱]        登录面板(密码不回显、交互输入),获取「客户端专用」节点权限
   update            更新订阅 + 合并客户端专用节点、生成运行配置
   start|stop|restart|status   内核进程管理
   nodes             列出节点(当前策略组)
@@ -1145,5 +1175,5 @@ if __name__ == "__main__":
     if not fn:
         print(f"未知命令: {cmd}\n{USAGE}")
         sys.exit(2)
-    os.makedirs(CONF_DIR, exist_ok=True)
+    ensure_conf_dir()
     fn(sys.argv[2:])

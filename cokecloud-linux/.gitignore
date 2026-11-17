@@ -14,5 +14,5 @@ ui/
 sub-raw.yaml
 runtime.yaml
 
-# 调研材料(含个人订阅数据,严禁入库)
-../research/
+# 调研材料 /research/ 由仓库根 .gitignore 的 /research/ 规则保护;
+# 子目录 .gitignore 的规则管不到上级目录,原 ../research/ 写法无效,已移除。

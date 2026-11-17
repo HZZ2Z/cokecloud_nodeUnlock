@@ -19,7 +19,7 @@
 
 | 渠道 | 内容 |
 |---|---|
-| 订阅接口 `GET /config?token=…`(端口 1000) | 57 个真实节点;**所有 UA 返回内容一致**(仅 `client-fingerprint` 每次随机 chrome/edge/safari/firefox/ios/qq);UA=`sing-box` 会 500;UA=`mihomo/clash*/karing` 返回完整 clash YAML,其余 UA 返回 base64 节点列表 |
+| 订阅接口 `GET /config?token=…`(端口已脱敏) | 57 个真实节点;**所有 UA 返回内容一致**(仅 `client-fingerprint` 每次随机 chrome/edge/safari/firefox/ios/qq);UA=`sing-box` 会 500;UA=`mihomo/clash*/karing` 返回完整 clash YAML,其余 UA 返回 base64 节点列表 |
 | 面板 API `GET /api/v1/user/server/fetch`(登录后) | 120 个节点,其中 63 个 tags=["客户端专用"] |
 
 「客户端专用」节点 = 同一服务的**伪装域名入口**(host 如 `www.qq.com`)与
@@ -29,10 +29,11 @@
 ## 3. 伪装域名的工作机制(关键)
 
 - `www.qq.com` 用公共 DNS 解析到腾讯 CDN IP,直接 ss 拨号**必然超时**。
-- 端口与订阅 BGP 入口体系完全一致(如香港A[BGP]:waic…:21553 与 www.qq.com:21553)。
+- 端口与订阅 BGP 入口体系完全一致(如香港A[BGP]:<中转域名已脱敏>:<端口已脱敏>
+  与 www.qq.com:<同一端口>)。
 - 实测:用订阅中转域名解析出的入口 IP 直连「客户端专用」端口,**全部 TCP 可达**。
 - 结论:官方客户端内部把伪装域名映射到真实中转入口(其私有 DoH
-  `koala.madns-lemon.site:2443` 等实测不可达,是死胡同,不是机制本体)。
+  服务的具体主机名与端口已脱敏,实测不可达,是死胡同,不是机制本体)。
 - 本工具的实现:合并时把非中转域名统一替换为订阅中出现频次最高的 ss 中转域名。
 
 ## 4. 节点构成(实测)

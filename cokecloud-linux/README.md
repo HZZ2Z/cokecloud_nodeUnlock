@@ -31,8 +31,8 @@
 ./install.sh
 # 2. 初始化(粘贴网页「我的订阅」里的订阅链接,或账号密码)
 ./cokectl init
-# 3. 登录面板(解锁「客户端专用」节点,强烈推荐)
-./cokectl login 邮箱 密码
+# 3. 登录面板(解锁「客户端专用」节点,强烈推荐;密码交互输入、不回显)
+./cokectl login
 # 4A. Clash Verge 前端(推荐):
 ./cokectl serve start && ./cokectl verge-import
 # 4B. 独立模式(不装 Verge):
@@ -56,11 +56,12 @@
 
 ## 配置与数据(全部在本机)
 
-`~/.config/cokecloud/`:`config.json`(订阅地址/面板 token/端口,建议 600 权限)、
-`runtime.yaml`(生成的运行配置)、`sub-raw.yaml`(订阅缓存)、`plan.json`(套餐流量)、
-日志与 pid。卸载即删除该目录。
+`~/.config/cokecloud/`:`config.json`(订阅地址/面板 token/端口,程序强制 600 权限,
+目录 700)、`runtime.yaml`(生成的运行配置)、`sub-raw.yaml`(订阅缓存)、
+`plan.json`(套餐流量)、日志与 pid。卸载即删除该目录。
 
-`config.json` 支持:`api_base`(其他 V2Board 站点)、`mixed_port`、`api_port`、
+`config.json` 支持:`api_base`(面板地址;出于隐私不入库,需在本地配置,
+或用环境变量 `COKECLOUD_API_BASE` 指定)、`mixed_port`、`api_port`、
 `provider_port`。
 
 ## 安全与隐私
@@ -69,7 +70,8 @@
   面板「个人中心」重置订阅。
 - 本地订阅提供器只监听 `127.0.0.1`;运行配置默认 `allow-lan: false`、控制接口
   仅本机 + 随机 secret。
-- 本仓库不包含任何个人凭证;`bin/mihomo-bin` 为运行所需内核,已被 .gitignore 排除。
+- 本仓库不包含任何个人凭证与服务商端点(域名/端口);`bin/mihomo-bin` 为运行
+  所需内核,已被 .gitignore 排除。
 
 ## 免责声明
 
