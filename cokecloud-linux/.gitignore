@@ -1,0 +1,18 @@
+# 运行时/机器相关,不入库
+bin/mihomo-bin
+bin/*.gz
+__pycache__/
+*.pyc
+
+# 用户私有配置与状态(~/.config/cokecloud 内的,若本地误放)
+config.json
+plan.json
+cache.db
+*.log
+*.pid
+ui/
+sub-raw.yaml
+runtime.yaml
+
+# 调研材料(含个人订阅数据,严禁入库)
+../research/

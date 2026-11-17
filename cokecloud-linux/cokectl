@@ -1,0 +1,1149 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+cokectl —— CokeCloud Linux 客户端
+=================================
+
+思路:官方客户端 = Tauri 壳 + mihomo(Clash Meta)内核。
+本客户端在 Linux 上复刻同一架构:订阅拉取 -> 生成 mihomo 配置 -> 托管内核进程,
+并提供节点切换 / 延迟测试 / 系统代理等能力,支持 0.5x 优质(VLESS+REALITY)节点。
+
+仅依赖 Python3 标准库(PyYAML 可选,用于更友好的节点信息展示)。
+
+用法示例:
+    ./cokectl init                          # 首次配置(粘贴订阅链接,或账号密码登录)
+    ./cokectl update                        # 更新订阅并生成运行配置
+    ./cokectl start                         # 启动代理内核
+    ./cokectl stop                          # 停止
+    ./cokectl status                        # 查看状态
+    ./cokectl nodes                         # 列出全部节点
+    ./cokectl premium                       # 只看优质节点(直连/0.5x)并测延迟
+    ./cokectl use 日本01[直连]               # 切换节点(支持序号/关键词)
+    ./cokectl use -a                        # 切到 ♻️ 自动选择(延迟优先)
+    ./cokectl proxy on|off                  # 开关 GNOME 系统代理
+    ./cokectl env                           # 打印终端代理环境变量
+    ./cokectl test                          # 连通性自检
+    ./cokectl ui                            # 安装并打开 Web 控制面板(metacubexd)
+    ./cokectl logs [-f]                     # 查看内核日志
+"""
+
+import base64
+import http.server
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+# ---------------------------------------------------------------- 常量
+
+APP = "cokectl"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CORE_BIN = os.path.join(APP_DIR, "bin", "mihomo-bin")
+CONF_DIR = os.path.join(os.path.expanduser("~"), ".config", "cokecloud")
+CONFIG_JSON = os.path.join(CONF_DIR, "config.json")
+SUB_RAW = os.path.join(CONF_DIR, "sub-raw.yaml")       # 订阅原样缓存
+RUNTIME_YAML = os.path.join(CONF_DIR, "runtime.yaml")  # 打补丁后的运行配置
+LOG_FILE = os.path.join(CONF_DIR, "mihomo.log")
+PID_FILE = os.path.join(CONF_DIR, "mihomo.pid")
+UI_DIR = os.path.join(CONF_DIR, "ui")
+
+API_BASE = "https://cokecloud.online"        # V2Board 站点默认值,可在配置里用 api_base 覆盖
+SUB_UA = "mihomo/1.19.34 (cokectl-linux)"    # 服务端对此 UA 返回完整 clash 配置
+GROUP_MAIN = "🔰 节点选择"                    # 主选择策略组(订阅自带)
+GROUP_AUTO = "♻️ 自动选择"
+
+PREMIUM_PAT = re.compile(r"AWSxGCP|GCPxAWS|0\.5x|直连")
+
+
+# ---------------------------------------------------------------- 工具
+
+def die(msg, code=1):
+    print(f"\033[31m[错误]\0330 {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def ok(msg):
+    print(f"\033[32m[ OK ]\0330 {msg}")
+
+
+def warn(msg):
+    print(f"\033[33m[提醒]\0330 {msg}")
+
+
+def http_get(url, headers=None, timeout=30, insecure=False):
+    req = urllib.request.Request(url, headers=headers or {})
+    ctx = None
+    if insecure:
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+        return r.read()
+
+
+def http_json(url, headers=None, timeout=30):
+    return json.loads(http_get(url, headers, timeout).decode("utf8"))
+
+
+def load_cfg():
+    if not os.path.exists(CONFIG_JSON):
+        return {}
+    with open(CONFIG_JSON, encoding="utf8") as f:
+        return json.load(f)
+
+
+def save_cfg(cfg):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    with open(CONFIG_JSON, "w", encoding="utf8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def api_headers(cfg):
+    h = {"User-Agent": SUB_UA}
+    tok = cfg.get("api_token")
+    if tok:
+        h["authorization"] = tok
+    return h
+
+
+# ---------------------------------------------------------------- init / login
+
+def cmd_login(args):
+    """账号密码登录,获取面板 API token(用于拉取「客户端专用」节点)。"""
+    cfg = load_cfg()
+    if args and len(args) >= 2:
+        email, password = args[0], args[1]
+    else:
+        email = input("邮箱: ").strip()
+        password = input("密码: ").strip()
+    print("登录中 ...")
+    body = json.dumps({"email": email, "password": password}).encode()
+    req = urllib.request.Request(
+        load_cfg().get("api_base", API_BASE) + "/api/v1/passport/auth/login",
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": SUB_UA},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode())
+    except Exception as e:
+        die(f"登录请求失败: {e}")
+    if not data.get("data"):
+        die(f"登录失败: {data.get('message', data)}")
+    d = data["data"]
+    cfg["api_token"] = d.get("token") or d.get("auth_data")
+    if args and len(args) >= 2:
+        cfg["api_email"] = email
+    save_cfg(cfg)
+    ok("登录成功,api_token 已保存")
+    print("   接下来执行 ./cokectl update 即可合并「客户端专用」节点")
+
+
+NODES_CACHE = os.path.join(CONF_DIR, "nodes-cache.json")
+
+
+def fetch_server_list(cfg):
+    """官方客户端同款接口:全量节点列表(含「客户端专用」伪装入口域名节点)。
+    成功后写本机缓存;面板不可用时用缓存兜底,保证 VIP 节点不丢。"""
+    tok = cfg.get("api_token")
+    if not tok:
+        return None
+    api = cfg.get("api_base", API_BASE)
+    nodes = None
+    try:
+        data = http_json(api + "/api/v1/user/server/fetch",
+                         {"authorization": tok, "User-Agent": SUB_UA}, timeout=60)
+        nodes = data.get("data") or []
+    except urllib.error.HTTPError as e:
+        warn(f"面板节点接口失败 HTTP {e.code}(token 可能过期,试试 ./cokectl login)")
+    except Exception as e:
+        warn(f"面板节点接口不可用({e}),尝试本机缓存 ...")
+    if nodes:
+        try:
+            with open(NODES_CACHE, "w", encoding="utf8") as f:
+                json.dump(nodes, f, ensure_ascii=False)
+            os.chmod(NODES_CACHE, 0o600)
+        except OSError:
+            pass
+        return nodes
+    if os.path.exists(NODES_CACHE):
+        try:
+            cached = json.load(open(NODES_CACHE, encoding="utf8"))
+            if cached:
+                warn("已使用本机缓存的节点清单(面板恢复后自动更新)")
+                return cached
+        except Exception:
+            pass
+    return None
+
+
+def merge_client_nodes(txt, cfg):
+    """把面板节点列表里订阅没有的节点(客户端专用)合并进 clash 配置。"""
+    try:
+        import yaml
+    except ImportError:
+        warn("未安装 PyYAML(pip3 install --user pyyaml),跳过客户端节点合并")
+        return txt
+    nodes = fetch_server_list(cfg)
+    if nodes is None:
+        return txt
+    base = yaml.safe_load(txt)
+    proxies = base.get("proxies") or []
+    have = {(p.get("server"), p.get("port")) for p in proxies}
+    names = {p["name"] for p in proxies}
+    ss_pwd, vl_uuid = None, None
+    for p in proxies:
+        if p.get("type") == "ss" and ss_pwd is None:
+            ss_pwd = p.get("password")
+        if p.get("type") == "vless" and vl_uuid is None:
+            vl_uuid = p.get("uuid")
+    # 客户端专用节点用伪装域名(如 www.qq.com)做入口,公共 DNS 解析不到真实服务器;
+    # 真实入口 = 订阅里出现最多的 ss 中转域名(官方客户端内部同样做了映射)
+    import collections as _collections
+    host_count = _collections.Counter(
+        p.get("server") for p in proxies if p.get("type") == "ss")
+    relay_host = host_count.most_common(1)[0][0] if host_count else None
+    new_names = []
+    orig_names = set(names)  # 合并前的原节点名,用于识别"全量型"策略组
+    for n in nodes:
+        if not n.get("is_online") or not n.get("show", 1):
+            continue
+        host, port = n.get("host"), n.get("port")
+        name = n.get("name") or f"node-{n.get('id')}"
+        if not host or not port:
+            continue
+        # 伪装域名(www.qq.com 等)替换为真实中转入口域名
+        if relay_host and "sys-metric-report.com" not in host:
+            host = relay_host
+        if (host, port) in have:
+            continue
+        t = n.get("type")
+        if t == "shadowsocks":
+            np = {"name": name, "type": "ss", "server": host, "port": port,
+                  "cipher": n.get("cipher") or "chacha20-ietf-poly1305",
+                  "password": ss_pwd, "udp": True}
+        elif t == "vless":
+            ts = n.get("tls_settings") or {}
+            np = {"name": name, "type": "vless", "server": host, "port": port,
+                  "uuid": vl_uuid, "alterId": 0, "cipher": "auto", "udp": True,
+                  "flow": n.get("flow") or "xtls-rprx-vision", "tls": True,
+                  "client-fingerprint": "chrome"}
+            if ts.get("server_name"):
+                np["servername"] = ts["server_name"]
+            if ts.get("public_key"):
+                np["reality-opts"] = {"public-key": ts["public_key"],
+                                      "short-id": ts.get("short_id") or ""}
+        else:
+            continue
+        final = name if name not in names else name + "·专"
+        i = 2
+        while final in names:
+            final = f"{name}·专{i}"
+            i += 1
+        np["name"] = final
+        names.add(final)
+        have.add((host, port))
+        proxies.append(np)
+        new_names.append(final)
+    if not new_names:
+        ok("面板节点与订阅一致,无需合并")
+        return txt
+    base["proxies"] = proxies
+    # 追加到所有"全量型"策略组(包含全部原节点的组:节点选择/自动/故障转移/
+    # 各分流组 YouTube/AI/漏网之鱼 等),保证规则模式下每组都能选到 VIP 节点
+    for g in base.get("proxy-groups") or []:
+        pl = g.get("proxies")
+        if not isinstance(pl, list) or not pl:
+            continue
+        hit = len([x for x in pl if x in orig_names])
+        if hit >= 0.95 * len(orig_names):
+            g["proxies"] = pl + new_names
+    ok(f"已合并 {len(new_names)} 个「客户端专用」节点(台湾/香港E-G/伪装域名入口等)")
+    return yaml.dump(base, allow_unicode=True, sort_keys=False, width=10 ** 6)
+
+
+def cmd_init(args):
+    cfg = load_cfg()
+    print("== CokeCloud Linux 客户端 初始化 ==")
+    print("1) 粘贴订阅链接 (推荐;在网页「我的订阅」页可复制)")
+    print("2) 账号密码登录自动获取")
+    way = input("选择方式 [1/2]: ").strip()
+    if way == "2":
+        email = input("邮箱: ").strip()
+        password = input("密码: ").strip()
+        sub_url = v2board_login_and_get_sub(email, password)
+        cfg["api_email"] = email
+        cfg["api_token"] = None  # 登录 token 仅一次性使用
+    else:
+        sub_url = input("订阅链接: ").strip()
+        if "token=" not in sub_url:
+            warn("订阅链接里通常包含 token=...,请确认粘贴完整")
+    # 提取 token,便于以后拼接不同格式
+    m = re.search(r"token=([0-9a-f]{16,64})", sub_url)
+    if not m:
+        die("无法从链接中解析 token,请检查链接是否完整")
+    cfg["sub_url"] = sub_url.strip()
+    cfg["token"] = m.group(1)
+    cfg.setdefault("mixed_port", 7890)
+    cfg.setdefault("api_port", 9090)
+    cfg["secret"] = secrets.token_hex(8)
+    save_cfg(cfg)
+    ok(f"配置已保存到 {CONFIG_JSON}")
+    ok("接下来执行: ./cokectl update && ./cokectl start")
+
+
+def v2board_login_and_get_sub(email, password):
+    print("登录中 ...")
+    body = json.dumps({"email": email, "password": password}).encode()
+    req = urllib.request.Request(
+        load_cfg().get("api_base", API_BASE) + "/api/v1/passport/auth/login",
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": SUB_UA},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode())
+    except Exception as e:
+        die(f"登录请求失败: {e}")
+    if data.get("data") is None:
+        die(f"登录失败: {data.get('message', data)}")
+    token = data["data"].get("token") or data["data"].get("auth_data")
+    print("获取订阅信息 ...")
+    sub = json.loads(http_get(
+        API_BASE + "/api/v1/user/getSubscribe",
+        {"authorization": token, "User-Agent": SUB_UA},
+    ).decode())
+    url = sub.get("data", {}).get("subscribe_url")
+    if not url:
+        die("未获取到订阅链接(可能未购买订阅)")
+    ok("登录成功")
+    return url
+
+
+# ---------------------------------------------------------------- 订阅下载与配置生成
+
+def fetch_subscription(cfg):
+    url = cfg.get("sub_url")
+    if not url:
+        die("尚未配置订阅,请先执行 ./cokectl init")
+    raw = http_get(url, {"User-Agent": SUB_UA}, timeout=60)
+    txt = raw.decode("utf8", "replace")
+    if "proxies:" not in txt:
+        # 有些服务器对未知 UA 返回 base64 节点列表;我们带的 UA 应命中 clash 格式
+        try:
+            decoded = base64.b64decode(txt + "=" * (-len(txt) % 4)).decode("utf8", "replace")
+            if "proxies:" in decoded:
+                txt = decoded
+        except Exception:
+            pass
+    if "proxies:" not in txt:
+        die("订阅内容不是 clash 格式(可能 token 失效或被限流),请稍后重试")
+    with open(SUB_RAW, "w", encoding="utf8") as f:
+        f.write(txt)
+    return txt
+
+
+def patch_config(txt, cfg):
+    """对订阅 clash 配置做文本级补丁,保留原格式。"""
+    port = int(cfg.get("mixed_port", 7890))
+    api_port = int(cfg.get("api_port", 9090))
+    secret = cfg.get("secret", "")
+
+    lines = txt.splitlines()
+    out, seen = [], set()
+    insert_after_ctrl = []
+    for ln in lines:
+        if re.match(r"^mixed-port\s*:", ln):
+            out.append(f"mixed-port: {port}")
+            seen.add("mixed-port")
+        elif re.match(r"^port\s*:", ln):
+            continue  # 去掉独立 http 端口,统一用 mixed
+        elif re.match(r"^socks-port\s*:", ln):
+            continue
+        elif re.match(r"^allow-lan\s*:", ln):
+            out.append("allow-lan: false")  # 安全默认;需要局域网共享再手改
+            seen.add("allow-lan")
+        elif re.match(r"^bind-address\s*:", ln):
+            continue
+        elif re.match(r"^external-controller\s*:", ln):
+            out.append(f"external-controller: 127.0.0.1:{api_port}")
+            seen.add("external-controller")
+            insert_after_ctrl = [f"secret: \"{secret}\""]
+        elif re.match(r"^secret\s*:", ln):
+            continue
+        elif re.match(r"^log-level\s*:", ln):
+            out.append("log-level: info")
+            seen.add("log-level")
+            if cfg.get("tun"):
+                out += [
+                    "tun:",
+                    "    enable: true",
+                    "    stack: mixed",
+                    "    auto-route: true",
+                    "    auto-detect-interface: true",
+                    "    dns-hijack:",
+                    "        - any:53",
+                ]
+        elif re.match(r"^external-ui\s*:", ln):
+            continue  # 后面按需插入
+        else:
+            out.append(ln)
+    # 插入 secret / external-ui
+    result = []
+    for ln in out:
+        result.append(ln)
+        if insert_after_ctrl and ln.startswith("external-controller:"):
+            if os.path.isdir(UI_DIR):
+                insert_after_ctrl.append(f"external-ui: {UI_DIR}")
+            result.extend(insert_after_ctrl)
+            insert_after_ctrl = []
+    if insert_after_ctrl:  # 配置里本来没有 external-controller
+        result.append(f"external-controller: 127.0.0.1:{api_port}")
+        result.extend(insert_after_ctrl)
+    # DNS 监听收紧到本机,并避开常见占用(1053/53)
+    result = [re.sub(r"listen:\s*'0\.0\.0\.0:\d+'", "listen: '127.0.0.1:6053'", ln)
+              for ln in result]
+    return "\n".join(result) + "\n"
+
+
+def fetch_plan_info(cfg):
+    """面板套餐信息(用于流量展示/Subscription-Userinfo)。"""
+    tok = cfg.get("api_token")
+    if not tok:
+        return None
+    try:
+        api = load_cfg().get("api_base", API_BASE)
+        data = json.loads(http_get(
+            api + "/api/v1/user/getSubscribe",
+            {"authorization": tok, "User-Agent": SUB_UA}, timeout=30).decode())
+        d = data.get("data") or {}
+        if d.get("transfer_enable"):
+            return {
+                "used": d.get("d") or 0,
+                "total": d.get("transfer_enable"),
+                "expire": d.get("expired_at") or 0,
+                "ts": int(time.time()),
+            }
+    except Exception:
+        pass
+    return None
+
+
+def build_config_text(cfg):
+    """完整管线:订阅 + 客户端专用节点合并 + 打补丁。"""
+    txt = fetch_subscription(cfg)
+    txt = merge_client_nodes(txt, cfg)
+    return patch_config(txt, cfg), txt
+
+
+def cmd_update(args):
+    cfg = load_cfg()
+    if not cfg.get("secret"):
+        cfg["secret"] = secrets.token_hex(8)
+        save_cfg(cfg)
+    print("拉取订阅 ...")
+    patched, raw = build_config_text(cfg)
+    # SUB_RAW 保存未打补丁的合并版(供 UI/日志查看)
+    with open(SUB_RAW, "w", encoding="utf8") as f:
+        f.write(raw)
+    with open(RUNTIME_YAML, "w", encoding="utf8") as f:
+        f.write(patched)
+    ok(f"订阅已更新: {SUB_RAW} ({len(raw.splitlines())} 行)")
+    ok(f"运行配置已生成: {RUNTIME_YAML}")
+
+
+# ---------------------------------------------------------------- 进程管理
+
+def core_alive():
+    if not os.path.exists(PID_FILE):
+        return None
+    try:
+        pid = int(open(PID_FILE).read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (ValueError, ProcessLookupError):
+        return None
+    except PermissionError:
+        return pid  # root 进程,本用户无权发信号,但进程存在
+
+
+def cmd_start(args):
+    cfg = load_cfg()
+    pid = core_alive()
+    if pid:
+        warn(f"内核已在运行 (pid {pid})")
+        return
+    if not os.path.exists(RUNTIME_YAML):
+        print("还没有运行配置,先更新订阅 ...")
+        cmd_update(args)
+    if not os.path.exists(CORE_BIN):
+        die(f"找不到内核 {CORE_BIN},请先安装 mihomo 内核")
+    # 端口占用检查(带 SO_REUSEADDR 与短暂重试,避免刚停止时的 TIME_WAIT 误报)
+    def port_free(p):
+        for _ in range(10):
+            s = socket.socket()
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", p))
+                return True
+            except OSError:
+                time.sleep(0.3)
+            finally:
+                s.close()
+        return False
+    for p in (int(cfg.get("mixed_port", 7890)), int(cfg.get("api_port", 9090))):
+        if not port_free(p):
+            die(f"端口 {p} 已被占用(可能有别的代理在跑),或修改 mixed_port/api_port")
+    with open(LOG_FILE, "ab") as logf:
+        proc = subprocess.Popen(
+            [CORE_BIN, "-d", CONF_DIR, "-f", RUNTIME_YAML],
+            stdout=logf, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    with open(PID_FILE, "w") as f:
+        f.write(str(proc.pid))
+    time.sleep(1.2)
+    if proc.poll() is not None:
+        die("内核启动失败,查看日志: ./cokectl logs")
+    ok(f"内核已启动 (pid {proc.pid}),混合端口 {cfg.get('mixed_port', 7890)}")
+    print(f"   日志: {LOG_FILE}")
+    print(f"   控制: http://127.0.0.1:{cfg.get('api_port', 9090)}")
+
+
+def cmd_stop(args):
+    pid = core_alive()
+    if not pid:
+        warn("内核未在运行")
+        return
+    helper = os.path.join(APP_DIR, "tun-helper.sh")
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(30):
+            if core_alive() is None:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        # root 的 TUN 内核,借 pkexec 停止
+        print("TUN 内核以 root 运行,请求授权停止 ...")
+        subprocess.run(["pkexec", helper, "stop", PID_FILE, str(os.getuid())],
+                       check=False)
+    try:
+        os.remove(PID_FILE)
+    except OSError:
+        pass
+    ok("内核已停止")
+
+
+def cmd_restart(args):
+    cmd_stop(args)
+    time.sleep(0.3)
+    cmd_start(args)
+
+
+def rest_url(cfg, path):
+    return f"http://127.0.0.1:{cfg.get('api_port', 9090)}{path}"
+
+
+def rest(cfg, method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(rest_url(cfg, path), data=data, method=method)
+    req.add_header("Authorization", f"Bearer {cfg.get('secret','')}")
+    if data:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            txt = r.read().decode()
+            return json.loads(txt) if txt.strip() else {}
+    except urllib.error.HTTPError as e:
+        return {"__error__": e.code, "message": e.read().decode(errors="replace")[:200]}
+    except Exception as e:
+        return {"__error__": str(e)}
+
+
+def cmd_status(args):
+    cfg = load_cfg()
+    pid = core_alive()
+    print(f"内核: {'运行中 pid=' + str(pid) if pid else '未运行'}")
+    if not pid:
+        return
+    v = rest(cfg, "GET", "/version")
+    if "__error__" in v:
+        die(f"控制接口无响应: {v}")
+    print(f"内核版本: {v.get('meta', True) and v.get('version')}")
+    proxies = rest(cfg, "GET", "/proxies")
+    g = proxies.get("proxies", {}).get(GROUP_MAIN)
+    if g:
+        print(f"当前节点: {g.get('now')}")
+    # 流量信息
+    try:
+        conn = rest(cfg, "GET", "/connections")
+        dl = conn.get("downloadTotal", 0) / 1048576
+        ul = conn.get("uploadTotal", 0) / 1048576
+        print(f"本次会话流量: ↓{dl:.1f}MB ↑{ul:.1f}MB, 活动连接 {len(conn.get('connections') or [])}")
+    except Exception:
+        pass
+    print(f"混合代理端口: {cfg.get('mixed_port', 7890)}")
+
+
+def list_groups(cfg):
+    proxies = rest(cfg, "GET", "/proxies").get("proxies", {})
+    groups = {k: v for k, v in proxies.items()
+              if v.get("type") in ("Selector", "URLTest", "Fallback", "LoadBalance")
+              and not v.get("all", []) == []}
+    return proxies, groups
+
+
+def cmd_nodes(args):
+    cfg = load_cfg()
+    proxies, groups = list_groups(cfg)
+    g = groups.get(GROUP_MAIN) or (list(groups.values())[0] if groups else None)
+    if not g:
+        die("内核未运行或接口异常,先 ./cokectl start")
+    now = g.get("now")
+    print(f"策略组: {g['name']}   当前: \033[36m{now}\0330")
+    names = g.get("all", [])
+    for i, n in enumerate(names):
+        mark = "→" if n == now else " "
+        delay = proxies.get(n, {}).get("history", [{}])
+        d = delay[-1].get("delay") if delay and delay[-1] else None
+        ds = f"{d}ms" if d else "  -"
+        tag = ""
+        if PREMIUM_PAT.search(n):
+            tag = " \033[35m★优质\0330"
+        print(f" {mark} {i:3d}  {ds:>7}  {n}{tag}")
+
+
+def pick_name(names, query):
+    q = query.strip()
+    if q.isdigit():
+        i = int(q)
+        if 0 <= i < len(names):
+            return names[i]
+        die(f"序号超出范围 0-{len(names)-1}")
+    # 精确 -> 包含
+    for n in names:
+        if n == q:
+            return n
+    hits = [n for n in names if q in n]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        print("匹配到多个节点:")
+        for h in hits:
+            print("  -", h)
+        die("请用更精确的关键词或序号")
+    die(f"找不到匹配 «{q}» 的节点")
+
+
+def cmd_use(args):
+    cfg = load_cfg()
+    target_group = GROUP_MAIN
+    name = None
+    if args and args[0] == "-a":
+        name = "自动选择"
+    elif args:
+        name = " ".join(args)
+    if not name:
+        die("用法: ./cokectl use <节点名|序号|关键词>  或  ./cokectl use -a(自动选择)")
+    proxies, groups = list_groups(cfg)
+    g = groups.get(GROUP_MAIN)
+    if not g:
+        die("内核未运行,先 ./cokectl start")
+    real = name if name == "自动选择" else pick_name(g.get("all", []), name)
+    r = rest(cfg, "PUT", f"/proxies/{urllib.parse.quote(GROUP_MAIN)}", {"name": real})
+    if "__error__" in r:
+        die(f"切换失败: {r}")
+    ok(f"已切换: {g.get('now')} → \033[36m{real}\0330")
+
+
+def measure_delays(cfg, names, timeout_ms=3000):
+    proxies, _ = list_groups(cfg)
+    out = {}
+    for n in names:
+        q = urllib.parse.quote(n)
+        r = rest(cfg, "GET", f"/proxies/{q}/delay?timeout={timeout_ms}"
+                 "&url=http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204")
+        if r.get("delay"):
+            out[n] = r["delay"]
+    return out
+
+
+def cmd_premium(args):
+    cfg = load_cfg()
+    proxies, groups = list_groups(cfg)
+    g = groups.get(GROUP_MAIN)
+    if not g:
+        die("内核未运行,先 ./cokectl start")
+    names = [n for n in g.get("all", []) if PREMIUM_PAT.search(n)]
+    print(f"优质节点共 {len(names)} 个,测延迟中 ...")
+    delays = measure_delays(cfg, names)
+    rows = sorted(names, key=lambda n: delays.get(n, 99999))
+    now = g.get("now")
+    for i, n in enumerate(rows):
+        d = delays.get(n)
+        mark = "→" if n == now else " "
+        ds = f"{d}ms" if d else "超时"
+        color = "\033[32m" if d and d < 300 else ("\033[33m" if d else "\033[31m")
+        print(f" {mark} {i:3d}  {color}{ds:>7}\0330  {n}")
+
+
+def cmd_delay(args):
+    cfg = load_cfg()
+    proxies, groups = list_groups(cfg)
+    g = groups.get(GROUP_MAIN)
+    if not g:
+        die("内核未运行,先 ./cokectl start")
+    if args:
+        n = pick_name(g.get("all", []), " ".join(args))
+        names = [n]
+    else:
+        names = g.get("all", [])
+    print(f"测 {len(names)} 个节点延迟 ...")
+    delays = measure_delays(cfg, names)
+    for n, d in sorted(delays.items(), key=lambda kv: kv[1]):
+        print(f"  {d:>5}ms  {n}")
+    miss = [n for n in names if n not in delays]
+    if miss:
+        print(f"  (超时/失败 {len(miss)} 个)")
+
+
+def cmd_test(args):
+    cfg = load_cfg()
+    port = cfg.get("mixed_port", 7890)
+    proxy = f"http://127.0.0.1:{port}"
+    handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    opener = urllib.request.build_opener(handler)
+    t0 = time.time()
+    try:
+        with opener.open("http://www.gstatic.com/generate_204", timeout=10) as r:
+            code = r.status
+    except Exception as e:
+        die(f"通过代理访问失败: {e}")
+    dt = (time.time() - t0) * 1000
+    if code == 204:
+        ok(f"代理连通正常 (HTTP {code}, {dt:.0f}ms)")
+    else:
+        warn(f"返回 HTTP {code}, {dt:.0f}ms")
+    # 显示出口 IP
+    try:
+        with opener.open("http://ip-api.com/json/?lang=zh-CN&fields=status,country,regionName,city,isp,query", timeout=10) as r:
+            geo = json.loads(r.read().decode())
+        if geo.get("status") == "success":
+            print(f"出口: {geo.get('country')} {geo.get('regionName')} {geo.get('city')}  IP: {geo.get('query')}  ISP: {geo.get('isp')}")
+        else:
+            warn(f"出口查询失败: {geo}")
+    except Exception as e:
+        warn(f"获取出口 IP 失败: {e}")
+
+
+# ---------------------------------------------------------------- 模式 / TUN
+
+MODES = {"rule": "规则", "global": "全局", "direct": "直连"}
+
+
+def cmd_mode(args):
+    """规则/全局/直连 模式切换(mihomo 运行时热切换)。"""
+    cfg = load_cfg()
+    m = args[0] if args else ""
+    if m not in MODES:
+        die("用法: ./cokectl mode rule|global|direct")
+    pid = core_alive()
+    if not pid:
+        die("内核未运行,先 ./cokectl start")
+    r = rest(cfg, "PATCH", "/configs", {"mode": m})
+    if isinstance(r, dict) and r.get("__error__"):
+        die(f"切换失败: {r}")
+    cfg["mode"] = m
+    save_cfg(cfg)
+    ok(f"已切换为 {MODES[m]} 模式")
+
+
+def cmd_tun(args):
+    """虚拟网卡(TUN)开关,需要 root 授权(pkexec 弹出密码框)。"""
+    cfg = load_cfg()
+    m = args[0] if args else ""
+    if m not in ("on", "off"):
+        die("用法: ./cokectl tun on|off")
+    want = m == "on"
+    if bool(cfg.get("tun")) == want and core_alive():
+        warn(f"TUN 已处于 {'开启' if want else '关闭'}状态")
+        return
+    cfg["tun"] = want
+    save_cfg(cfg)
+    print("重新生成配置 ...")
+    cmd_update([])
+    cmd_stop([])
+    if want:
+        helper = os.path.join(APP_DIR, "tun-helper.sh")
+        if not os.path.exists(CORE_BIN):
+            die("找不到内核")
+        print("请求 root 授权启动 TUN 内核(桌面会弹出密码框)...")
+        r = subprocess.run(["pkexec", helper, "start", CORE_BIN, CONF_DIR,
+                            RUNTIME_YAML, LOG_FILE, PID_FILE], check=False)
+        if r.returncode != 0:
+            die("授权失败或已取消")
+        time.sleep(1.2)
+        pid = core_alive()
+        if not pid:
+            die("TUN 内核启动失败,查看日志: ./cokectl logs")
+        ok(f"TUN 模式已开启 (root 内核 pid {pid}),虚拟网卡已接管全局流量")
+        warn("TUN 模式下无需系统代理;若已开启系统代理建议执行 ./cokectl proxy off")
+    else:
+        cmd_start([])
+        ok("已回到普通代理模式")
+
+
+# ---------------------------------------------------------------- 系统代理 / 环境
+
+def cmd_proxy(args):
+    mode = args[0] if args else ""
+    port = load_cfg().get("mixed_port", 7890)
+    if mode == "on":
+        if shutil.which("gsettings") is None:
+            die("未检测到 gsettings(非 GNOME 桌面),请在终端执行 ./cokectl env 设置环境变量")
+        cmds = [
+            ["gsettings", "set", "org.gnome.system.proxy", "mode", "manual"],
+            ["gsettings", "set", "org.gnome.system.proxy.http", "host", "127.0.0.1"],
+            ["gsettings", "set", "org.gnome.system.proxy.http", "port", str(port)],
+            ["gsettings", "set", "org.gnome.system.proxy.https", "host", "127.0.0.1"],
+            ["gsettings", "set", "org.gnome.system.proxy.https", "port", str(port)],
+            ["gsettings", "set", "org.gnome.system.proxy.socks", "host", "127.0.0.1"],
+            ["gsettings", "set", "org.gnome.system.proxy.socks", "port", str(port)],
+            ["gsettings", "set", "org.gnome.system.proxy", "ignore-hosts",
+             "['localhost','127.0.0.0/8','::1','10.0.0.0/8','192.168.0.0/16','.local']"],
+        ]
+        for c in cmds:
+            subprocess.run(c, check=False, capture_output=True)
+        ok(f"GNOME 系统代理已开启 → 127.0.0.1:{port}")
+        print("   提示:浏览器需重启才会生效;终端请另外执行 ./cokectl env")
+    elif mode == "off":
+        subprocess.run(["gsettings", "set", "org.gnome.system.proxy", "mode", "none"],
+                       check=False, capture_output=True)
+        ok("GNOME 系统代理已关闭")
+    else:
+        die("用法: ./cokectl proxy on|off")
+
+
+def cmd_env(args):
+    port = load_cfg().get("mixed_port", 7890)
+    print(f"export http_proxy=http://127.0.0.1:{port}")
+    print(f"export https_proxy=http://127.0.0.1:{port}")
+    print(f"export all_proxy=socks5://127.0.0.1:{port}")
+    print(f"export HTTP_PROXY=http://127.0.0.1:{port}")
+    print(f"export HTTPS_PROXY=http://127.0.0.1:{port}")
+    print(f"export ALL_PROXY=socks5://127.0.0.1:{port}")
+    print("export no_proxy=localhost,127.0.0.0/8,::1")
+
+
+# ---------------------------------------------------------------- Web UI
+
+def cmd_ui(args):
+    cfg = load_cfg()
+    if not os.path.isdir(UI_DIR) or not os.path.exists(os.path.join(UI_DIR, "index.html")):
+        print("下载 metacubexd 面板 (首次约 8MB) ...")
+        url = "https://ghfast.top/https://github.com/MetaCubeX/metacubexd/releases/latest/download/compressed-dist.tgz"
+        tgz = os.path.join(CONF_DIR, "ui.tgz")
+        try:
+            data = http_get(url, timeout=120)
+            with open(tgz, "wb") as f:
+                f.write(data)
+            os.makedirs(UI_DIR, exist_ok=True)
+            subprocess.run(["tar", "xzf", tgz, "-C", UI_DIR], check=True)
+        except Exception as e:
+            die(f"面板下载失败(可手动): {e}")
+        finally:
+            try:
+                os.remove(tgz)
+            except OSError:
+                pass
+        # 重新生成配置以带上 external-ui,并重启内核
+        txt = open(SUB_RAW, encoding="utf8").read() if os.path.exists(SUB_RAW) else None
+        if txt:
+            open(RUNTIME_YAML, "w", encoding="utf8").write(patch_config(txt, cfg))
+        if core_alive():
+            cmd_restart(args)
+    port = cfg.get("api_port", 9090)
+    url = f"http://127.0.0.1:{port}/ui/"
+    ok(f"控制面板: {url}")
+    subprocess.run(["xdg-open", url], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_logs(args):
+    follow = args and args[0] == "-f"
+    if follow:
+        subprocess.run(["tail", "-n", "50", "-f", LOG_FILE])
+    else:
+        if os.path.exists(LOG_FILE):
+            lines = open(LOG_FILE, encoding="utf8", errors="replace").read().splitlines()
+            print("\n".join(lines[-60:]))
+        else:
+            warn("暂无日志")
+
+
+def cmd_core(args):
+    """内核管理:./cokectl core install|version"""
+    sub = args[0] if args else "version"
+    if sub == "version":
+        if os.path.exists(CORE_BIN):
+            print(subprocess.run([CORE_BIN, "-v"], capture_output=True, text=True).stdout.strip())
+        else:
+            warn("内核未安装")
+    elif sub == "install":
+        print("请参考 README.md 下载内核放到", CORE_BIN)
+
+
+# ---------------------------------------------------------------- 本地订阅提供器
+# 让 Clash Verge 等成熟客户端直接使用全量节点(含客户端专用):
+#   http://127.0.0.1:9100/merged.yaml 作为 Verge 的订阅地址即可。
+
+SERVE_PID = os.path.join(CONF_DIR, "provider.pid")
+SERVE_LOG = os.path.join(CONF_DIR, "provider.log")
+SERVE_PORT_DEFAULT = 9100
+CACHE_TTL = 300
+
+_srv_state = {"txt": None, "ts": 0.0, "plan": None, "plan_ts": 0.0,
+              "lock": threading.Lock()}
+
+
+def _autostart_entry():
+    d = os.path.join(os.path.expanduser("~"), ".config", "autostart")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "cokecloud-provider.desktop")
+    with open(path, "w", encoding="utf8") as f:
+        f.write("[Desktop Entry]\nType=Application\n"
+                "Name=CokeCloud Provider\n"
+                f"Exec={sys.executable} {os.path.abspath(__file__)} serve run\n"
+                "X-GNOME-Autostart-enabled=true\nTerminal=false\n")
+    return path
+
+
+def _build_merged(force=False):
+    """带缓存的配置构建(5 分钟过期,?refresh=1 强制)。"""
+    with _srv_state["lock"]:
+        now = time.time()
+        if _srv_state["txt"] is None or force or now - _srv_state["ts"] > CACHE_TTL:
+            cfg = load_cfg()
+            patched, raw = build_config_text(cfg)
+            _srv_state["txt"] = patched
+            _srv_state["ts"] = now
+            try:
+                with open(RUNTIME_YAML, "w", encoding="utf8") as f:
+                    f.write(patched)
+            except OSError:
+                pass
+        if (_srv_state["plan"] is None
+                or now - _srv_state["plan_ts"] > 600):
+            info = fetch_plan_info(load_cfg())
+            if info:
+                _srv_state["plan"] = info
+                _srv_state["plan_ts"] = now
+                try:
+                    with open(os.path.join(CONF_DIR, "plan.json"), "w",
+                              encoding="utf8") as f:
+                        json.dump(info, f)
+                except OSError:
+                    pass
+        return _srv_state["txt"], _srv_state["plan"]
+
+
+class _ServeHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def _reply(self, code, body, ctype="text/plain; charset=utf-8",
+               extra=None):
+        data = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        p = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(p.query)
+        try:
+            if p.path in ("/merged.yaml", "/config", "/sub.yaml",
+                          "/cokecloud.yaml"):
+                txt, plan = _build_merged(
+                    force="1" in (qs.get("refresh") or []))
+                extra = {}
+                if plan:
+                    extra["Subscription-Userinfo"] = (
+                        f"upload=0; download={plan['used']}; "
+                        f"total={plan['total']}; expire={plan['expire']}")
+                self._reply(200, txt, "text/yaml; charset=utf-8", extra)
+            elif p.path == "/healthz":
+                self._reply(200, "ok")
+            elif p.path == "/":
+                self._reply(200,
+                            "CokeCloud 本地订阅提供器\n"
+                            "订阅地址: http://127.0.0.1:%d/merged.yaml\n"
+                            % self.server.server_address[1])
+            else:
+                self._reply(404, "not found")
+        except Exception as e:
+            self._reply(502, f"build config failed: {e}")
+
+
+def _serve_run():
+    cfg = load_cfg()
+    port = int(cfg.get("provider_port", SERVE_PORT_DEFAULT))
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), _ServeHandler)
+
+    def _term(signo, _frame):
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+    signal.signal(signal.SIGTERM, _term)
+    signal.signal(signal.SIGINT, _term)
+    try:
+        srv.serve_forever()
+    finally:
+        srv.server_close()
+
+
+def _serve_is_alive():
+    if not os.path.exists(SERVE_PID):
+        return None
+    try:
+        pid = int(open(SERVE_PID).read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (ValueError, ProcessLookupError):
+        return None
+    except PermissionError:
+        return pid
+
+
+def cmd_serve(args):
+    """本地订阅提供器:供 Clash Verge 引用全量节点。serve start|stop|run|status"""
+    sub = args[0] if args else "status"
+    cfg = load_cfg()
+    port = int(cfg.get("provider_port", SERVE_PORT_DEFAULT))
+    url = f"http://127.0.0.1:{port}/merged.yaml"
+    if sub == "run":
+        with open(SERVE_PID, "w") as f:
+            f.write(str(os.getpid()))
+        ok(f"订阅提供器已启动: {url}")
+        _serve_run()
+        return
+    if sub == "start":
+        pid = _serve_is_alive()
+        if pid:
+            warn(f"提供器已在运行 (pid {pid})")
+        else:
+            # 先试构建一次,提前暴露 token/网络问题
+            _build_merged()
+            with open(SERVE_LOG, "ab") as logf:
+                proc = subprocess.Popen(
+                    [sys.executable, os.path.abspath(__file__), "serve", "run"],
+                    stdout=logf, stderr=subprocess.STDOUT,
+                    start_new_session=True)
+            with open(SERVE_PID, "w") as f:
+                f.write(str(proc.pid))
+            time.sleep(1.0)
+            if _serve_is_alive() is None:
+                die("提供器启动失败,查看 " + SERVE_LOG)
+        _autostart_entry()
+        ok(f"订阅地址(粘到 Clash Verge 订阅页导入): {url}")
+        ok("一键导入命令: ./cokectl verge-import")
+        return
+    if sub == "stop":
+        pid = _serve_is_alive()
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except PermissionError:
+                die("无权限停止该进程")
+            try:
+                os.remove(SERVE_PID)
+            except OSError:
+                pass
+            ok("提供器已停止")
+        else:
+            warn("提供器未在运行")
+        return
+    if sub == "status":
+        pid = _serve_is_alive()
+        print(f"提供器: {'运行中 pid=' + str(pid) if pid else '未运行'}")
+        print(f"订阅地址: {url}")
+        return
+    die("用法: ./cokectl serve start|stop|status|run")
+
+
+def cmd_verge_import(args):
+    """唤起 Clash Verge 一键导入本地全量订阅(clash:// 协议)。"""
+    cfg = load_cfg()
+    port = int(cfg.get("provider_port", SERVE_PORT_DEFAULT))
+    sub_url = (f"http://127.0.0.1:{port}/merged.yaml")
+    deep = ("clash://install-config?url=" + urllib.parse.quote(sub_url, safe="")
+            + "&name=" + urllib.parse.quote("CokeCloud 全量"))
+    ok("正在唤起 Clash Verge 导入窗口,请在弹窗中确认 ...")
+    subprocess.run(["xdg-open", deep], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+
+# ---------------------------------------------------------------- main
+
+USAGE = """用法: cokectl <命令> [参数]
+
+  init              首次配置(订阅链接或账号密码)
+  login <邮箱> <密码>  登录面板,获取「客户端专用」节点权限
+  update            更新订阅 + 合并客户端专用节点、生成运行配置
+  start|stop|restart|status   内核进程管理
+  nodes             列出节点(当前策略组)
+  premium           优质节点(直连/0.5x)延迟排序
+  use <节点|序号|-a>  切换节点(-a 自动选择)
+  mode rule|global|direct     规则/全局/直连 模式
+  tun on|off        虚拟网卡 TUN 模式(需 root 授权)
+  delay [节点]       测延迟
+  test              连通性自检(出口 IP)
+  proxy on|off      GNOME 系统代理开关
+  env               打印终端代理环境变量
+  ui                安装/打开 Web 控制面板
+  serve start|stop|status     本地订阅提供器(Clash Verge 用)
+  verge-import      一键唤起 Clash Verge 导入全量订阅
+  logs [-f]         查看内核日志
+  core version      查看内核版本
+"""
+
+CMDS = {
+    "init": cmd_init, "login": cmd_login, "update": cmd_update,
+    "start": cmd_start, "stop": cmd_stop, "restart": cmd_restart, "status": cmd_status,
+    "nodes": cmd_nodes, "premium": cmd_premium, "use": cmd_use, "delay": cmd_delay,
+    "mode": cmd_mode, "tun": cmd_tun,
+    "test": cmd_test, "proxy": cmd_proxy, "env": cmd_env,
+    "ui": cmd_ui, "logs": cmd_logs, "core": cmd_core,
+    "serve": cmd_serve, "verge-import": cmd_verge_import,
+}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(USAGE)
+        sys.exit(0)
+    cmd = sys.argv[1]
+    fn = CMDS.get(cmd)
+    if not fn:
+        print(f"未知命令: {cmd}\n{USAGE}")
+        sys.exit(2)
+    os.makedirs(CONF_DIR, exist_ok=True)
+    fn(sys.argv[2:])
